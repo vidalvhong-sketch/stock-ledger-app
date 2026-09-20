@@ -21,7 +21,11 @@ async function api(path, opts = {}) {
   }
   let data = {};
   try { data = await res.json(); } catch (e) { /* no body */ }
-  if (!res.ok) throw new Error(data.error || 'Request failed');
+  if (!res.ok) {
+    const err = new Error(data.error || 'Request failed');
+    err.data = data; // callers that need extra response fields (e.g. needsDiscountApproval) can check e.data
+    throw err;
+  }
   return data;
 }
 
@@ -202,6 +206,12 @@ let state = {
   // POS receipt
   lastSale: null,
   pickingVariantFor: null,
+  discountApprovalPending: false,
+  discountApprovalEmailInput: '',
+  discountApprovalPinBuffer: '',
+  discountApprovalBusy: false,
+  discountApprovalError: '',
+  pendingDiscountToken: null,
   isOnline: navigator.onLine,
   offlineQueue: [],
   syncingOffline: false,
@@ -225,6 +235,8 @@ let state = {
   turnoverNotes: '',
   turnoverResult: null,
   shiftsHistory: [],
+  approvalRequests: [],
+  approvalsFilter: 'pending',
   shiftsStart: daysAgoISO(6),
   shiftsEnd: todayStr(),
 
@@ -422,6 +434,8 @@ async function loadTabData(tab) {
       await loadSalesHistory();
     } else if (tab === 'shifts') {
       await loadShiftsHistory();
+    } else if (tab === 'approvals') {
+      await loadApprovals();
     } else if (tab === 'items') {
       state.menuItems = await api('/api/menu');
     }
@@ -718,6 +732,25 @@ async function loadShiftsHistory() {
   state.shiftsHistory = await api(`/api/shifts?start=${state.shiftsStart}&end=${state.shiftsEnd}`);
 }
 
+async function loadApprovals() {
+  const q = state.approvalsFilter ? '?status=' + state.approvalsFilter : '';
+  try {
+    state.approvalRequests = await api('/api/approvals/requests' + q);
+  } catch (e) {
+    state.approvalRequests = [];
+    toast(e.message, 'bad');
+  }
+}
+
+async function reviewApprovalAction(id, status) {
+  try {
+    await api('/api/approvals/requests/' + id + '/review', { method: 'PUT', body: JSON.stringify({ status }) });
+    toast(status === 'approved' ? 'Approved.' : 'Denied.', status === 'approved' ? 'good' : 'accent');
+    await loadApprovals();
+    render();
+  } catch (e) { toast(e.message, 'bad'); }
+}
+
 /* ============================= SHIFT TURNOVER VERIFICATION ============================= */
 function openVerifyModal(shift) {
   state.verifyingShift = shift;
@@ -761,6 +794,33 @@ async function submitShiftVerification() {
     state.verifyBusy = false;
     render();
   }
+}
+
+function renderDiscountApprovalModal() {
+  if (!state.discountApprovalPending) return '';
+  const dots = Array.from({ length: Math.max(4, state.discountApprovalPinBuffer.length) }).map((_, i) =>
+    `<span class="pin-dot ${i < state.discountApprovalPinBuffer.length ? 'filled' : ''}"></span>`).join('');
+  return `
+  <div class="modal-backdrop">
+    <div class="card fade-in" style="max-width:340px;width:100%;">
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;">
+        <div class="font-display" style="font-size:17px;">Discount needs approval</div>
+        <button id="closeDiscountApprovalBtn" style="background:none;border:none;color:var(--text-faint);font-size:22px;cursor:pointer;line-height:1;">×</button>
+      </div>
+      <div style="color:var(--text-faint);font-size:12.5px;margin-bottom:14px;">A Team Lead, Manager, or Admin needs to confirm this with their own email + PIN before checkout can continue.</div>
+      <label>Approver's email</label>
+      <input id="discountApprovalEmailField" type="email" placeholder="you@email.com" value="${escapeHtml(state.discountApprovalEmailInput)}" autocomplete="off"/>
+      <div style="display:flex;gap:10px;justify-content:center;margin:14px 0 6px;">${dots}</div>
+      ${state.discountApprovalError ? `<div style="color:var(--bad-soft);font-size:12.5px;margin-bottom:8px;">${escapeHtml(state.discountApprovalError)}</div>` : '<div style="height:19px;"></div>'}
+      <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin-top:6px;">
+        ${['1', '2', '3', '4', '5', '6', '7', '8', '9', '⌫', '0', '✓'].map(k => {
+          if (k === '⌫') return `<button class="keypad-btn" id="discountApprovalBack">⌫</button>`;
+          if (k === '✓') return `<button class="keypad-btn enter" id="discountApprovalEnter" ${state.discountApprovalBusy ? 'disabled' : ''}>${state.discountApprovalBusy ? '…' : '✓'}</button>`;
+          return `<button class="keypad-btn discount-approval-digit" data-d="${k}">${k}</button>`;
+        }).join('')}
+      </div>
+    </div>
+  </div>`;
 }
 
 function renderVerifyModal() {
@@ -948,22 +1008,63 @@ async function checkoutAction() {
     orderType: state.posOrderType,
     customerName: state.posCustomerName
   };
+  if (state.pendingDiscountToken) payload.discountApprovalToken = state.pendingDiscountToken;
   try {
     const sale = await api('/api/sales/checkout', { method: 'POST', body: JSON.stringify(payload) });
+    state.pendingDiscountToken = null;
     toast(`Sale complete — ${fmtMoney(sale.total)}`, 'good');
     state.lastSale = Object.assign({}, sale, { items: state.cart.slice() });
     clearCart();
     render();
   } catch (e) {
     if (looksLikeNetworkFailure(e)) { queueOfflineSale(payload, state.cart.slice()); return; }
+    if (e.data && e.data.needsDiscountApproval) { openDiscountApprovalModal(); return; }
     toast(e.message, 'bad');
+  }
+}
+
+function openDiscountApprovalModal() {
+  state.discountApprovalPending = true;
+  state.discountApprovalEmailInput = '';
+  state.discountApprovalPinBuffer = '';
+  state.discountApprovalError = '';
+  render();
+}
+function closeDiscountApprovalModal() { state.discountApprovalPending = false; render(); }
+function discountApprovalPressDigit(d) {
+  if (state.discountApprovalPinBuffer.length >= 8) return;
+  state.discountApprovalError = '';
+  state.discountApprovalPinBuffer += d;
+  render();
+}
+function discountApprovalBackspace() { state.discountApprovalPinBuffer = state.discountApprovalPinBuffer.slice(0, -1); render(); }
+
+async function submitDiscountApproval() {
+  if (!state.discountApprovalEmailInput.trim()) { state.discountApprovalError = 'Enter the approver\'s email.'; render(); return; }
+  if (state.discountApprovalPinBuffer.length < 4) { state.discountApprovalError = 'Enter the approver\'s PIN.'; render(); return; }
+  state.discountApprovalBusy = true; state.discountApprovalError = ''; render();
+  try {
+    const result = await api('/api/approvals/discount-approval', {
+      method: 'POST',
+      body: JSON.stringify({ email: state.discountApprovalEmailInput.trim(), pin: state.discountApprovalPinBuffer, cashierId: state.user.id })
+    });
+    state.pendingDiscountToken = result.token;
+    state.discountApprovalPending = false;
+    state.discountApprovalBusy = false;
+    toast(`Discount approved by ${result.approvedBy}.`, 'good');
+    render();
+    await checkoutAction(); // retry automatically now that we have a valid token
+  } catch (e) {
+    state.discountApprovalError = e.message;
+    state.discountApprovalBusy = false;
+    render();
   }
 }
 
 async function voidSaleAction(id, reason) {
   try {
-    await api('/api/sales/' + id, { method: 'DELETE', body: JSON.stringify({ reason }) });
-    toast('Sale voided.', 'accent');
+    const result = await api('/api/sales/' + id, { method: 'DELETE', body: JSON.stringify({ reason }) });
+    toast(result.pending ? 'Sent for approval — a Team Lead, Manager, or Admin needs to review it.' : 'Sale voided.', 'accent');
     state.confirmModal = null; state.reasonInput = '';
     await loadSalesHistory();
     render();
@@ -973,7 +1074,7 @@ async function voidSaleAction(id, reason) {
 async function refundSaleAction(id, amount, reason) {
   try {
     const refund = await api('/api/sales/' + id + '/refund', { method: 'POST', body: JSON.stringify({ amount, reason }) });
-    toast(`Refunded ${fmtMoney(refund.amount)} — ${refund.invoice_no}`, 'accent');
+    toast(refund.pending ? 'Sent for approval — a Team Lead, Manager, or Admin needs to review it.' : `Refunded ${fmtMoney(refund.amount)} — ${refund.invoice_no}`, 'accent');
     state.confirmModal = null; state.reasonInput = ''; state.amountInput = '';
     await loadSalesHistory();
     render();
@@ -2015,6 +2116,7 @@ function tabsForApp(mode) {
   }
   if (mode === 'pos') {
     const tabs = [['register', 'Register', 'register'], ['kitchen', 'Kitchen', 'kitchen'], ['recipes', 'Recipes', 'recipe'], ['history', 'Sales', 'history']];
+    if (['admin', 'team_lead', 'manager'].includes(state.user.role)) tabs.push(['approvals', 'Approvals', 'requests']);
     if (state.user.role === 'admin') tabs.push(['shifts', 'Shifts', 'payroll'], ['items', 'Menu', 'menu']);
     return tabs;
   }
@@ -2089,6 +2191,7 @@ function renderShell() {
     ${renderModal()}
     ${renderInlineKioskModal()}
     ${renderVerifyModal()}
+    ${renderDiscountApprovalModal()}
   </div>`;
 }
 
@@ -2164,6 +2267,7 @@ function renderTab() {
       case 'recipes': return renderPosRecipes();
       case 'history': return renderPosHistory();
       case 'shifts': return state.user.role === 'admin' ? renderShiftsHistory() : '<div>Not authorized.</div>';
+      case 'approvals': return renderApprovals();
       case 'items': return state.user.role === 'admin' ? renderPosItems() : '<div>Not authorized.</div>';
       default: return '';
     }
@@ -3599,6 +3703,41 @@ function renderPosHistory() {
 }
 
 /* ============================= POS: MENU ITEMS (ADMIN) ============================= */
+function renderApprovals() {
+  const filters = [['pending', 'Pending'], ['approved', 'Approved'], ['denied', 'Denied'], ['', 'All']];
+  const requests = state.approvalRequests || [];
+  return `
+  <div class="fade-in">
+    <div style="display:flex;gap:8px;margin-bottom:14px;flex-wrap:wrap;">
+      ${filters.map(([id, label]) => `<button class="btn ${state.approvalsFilter === id ? 'btn-accent' : 'btn-ghost'} approvals-filter-btn" data-status="${id}" style="padding:7px 12px;font-size:12.5px;">${label}</button>`).join('')}
+    </div>
+    <div style="display:flex;flex-direction:column;gap:10px;">
+      ${requests.length === 0 ? `<div class="card" style="color:var(--text-faint);text-align:center;">Nothing here.</div>` :
+      requests.map(r => `
+        <div class="card">
+          <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:10px;">
+            <div>
+              <div style="font-weight:600;">${r.type === 'void' ? 'Void' : 'Refund'} — ${escapeHtml(r.invoice_no || 'Unknown sale')}</div>
+              <div class="font-mono" style="font-size:11.5px;color:var(--text-faint);margin-top:2px;">
+                Requested by ${escapeHtml(r.requested_by_name)} · ${fmtDateTimeShort(r.created_at)}
+                ${r.sale_total != null ? ` · sale total ${fmtMoney(r.sale_total)}` : ''}
+                ${r.type === 'refund' && r.amount != null ? ` · refund amount ${fmtMoney(r.amount)}` : ''}
+              </div>
+              ${r.reason ? `<div style="font-size:13px;color:var(--text-dim);margin-top:8px;">"${escapeHtml(r.reason)}"</div>` : ''}
+            </div>
+            <span class="badge ${r.status === 'approved' ? 'badge-good' : r.status === 'denied' ? 'badge-bad' : 'badge-accent'}">${r.status}</span>
+          </div>
+          ${r.status === 'pending' ? `
+            <div style="display:flex;gap:8px;margin-top:12px;">
+              <button class="btn btn-good approval-review-btn" data-id="${r.id}" data-status="approved" style="flex:1;padding:8px;font-size:12.5px;">Approve</button>
+              <button class="btn btn-bad approval-review-btn" data-id="${r.id}" data-status="denied" style="flex:1;padding:8px;font-size:12.5px;">Deny</button>
+            </div>` : r.reviewed_by ? `<div class="font-mono" style="font-size:11px;color:var(--text-faint);margin-top:10px;">reviewed by ${escapeHtml(r.reviewed_by)}</div>` : ''}
+        </div>`).join('')}
+    </div>
+    <div style="color:var(--text-faint);font-size:11.5px;margin-top:14px;">Staff without approval authority land here when they try to void or refund a sale — approving actually completes the void/refund; denying leaves the sale untouched.</div>
+  </div>`;
+}
+
 function renderShiftsHistory() {
   const shifts = state.shiftsHistory || [];
   const closedShifts = shifts.filter(s => s.status === 'closed');
@@ -4978,6 +5117,13 @@ function attachShellHandlers() {
     await loadSalesHistory();
     state.loadingTab = false; render();
   });
+  document.querySelectorAll('.approvals-filter-btn').forEach(b => b.addEventListener('click', async () => {
+    state.approvalsFilter = b.getAttribute('data-status');
+    state.loadingTab = true; render();
+    await loadApprovals();
+    state.loadingTab = false; render();
+  }));
+  document.querySelectorAll('.approval-review-btn').forEach(b => b.addEventListener('click', () => reviewApprovalAction(b.getAttribute('data-id'), b.getAttribute('data-status'))));
   document.getElementById('shiftsStartPick')?.addEventListener('change', async e => {
     state.shiftsStart = e.target.value;
     state.loadingTab = true; render();
@@ -5241,6 +5387,13 @@ function attachShellHandlers() {
   document.querySelectorAll('.verify-digit').forEach(b => b.addEventListener('click', () => verifyPressDigit(b.getAttribute('data-d'))));
   document.getElementById('verifyPinBack')?.addEventListener('click', verifyBackspace);
   document.getElementById('verifyPinEnter')?.addEventListener('click', submitShiftVerification);
+
+  /* ---- Discount approval modal ---- */
+  document.getElementById('closeDiscountApprovalBtn')?.addEventListener('click', closeDiscountApprovalModal);
+  document.getElementById('discountApprovalEmailField')?.addEventListener('input', e => { state.discountApprovalEmailInput = e.target.value; });
+  document.querySelectorAll('.discount-approval-digit').forEach(b => b.addEventListener('click', () => discountApprovalPressDigit(b.getAttribute('data-d'))));
+  document.getElementById('discountApprovalBack')?.addEventListener('click', discountApprovalBackspace);
+  document.getElementById('discountApprovalEnter')?.addEventListener('click', submitDiscountApproval);
 
   document.getElementById('newNoticeBtn')?.addEventListener('click', () => {
     state.newNotice = { type: 'memo', userId: null, title: '', body: '', requiresAck: true };

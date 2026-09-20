@@ -3,6 +3,7 @@ const { v4: uuidv4 } = require('uuid');
 const { db } = require('../db');
 const { authRequired, adminRequired } = require('../middleware/auth');
 const { logAudit } = require('../lib/audit');
+const { canApprove } = require('../lib/permissions');
 const { nextInvoiceNumber, nextCreditMemoNumber } = require('../lib/counters');
 
 const router = express.Router();
@@ -68,6 +69,15 @@ router.post('/checkout', (req, res) => {
   }
 
   const dType = discountType === 'senior_pwd' ? 'senior_pwd' : '';
+  if (dType && !canApprove(db, req.user.id)) {
+    const token = req.body.discountApprovalToken;
+    if (!token) return res.status(400).json({ error: 'This discount needs approval from a Team Lead, Manager, or Admin.', needsDiscountApproval: true });
+    const approval = db.prepare('SELECT * FROM discount_approvals WHERE id = ? AND used = 0').get(token);
+    if (!approval) return res.status(400).json({ error: 'That discount approval is invalid or already used.', needsDiscountApproval: true });
+    const ageMinutes = (Date.now() - new Date(approval.created_at.replace(' ', 'T') + 'Z').getTime()) / 60000;
+    if (ageMinutes > 15) return res.status(400).json({ error: 'That discount approval expired — please get it approved again.', needsDiscountApproval: true });
+    db.prepare('UPDATE discount_approvals SET used = 1 WHERE id = ?').run(token);
+  }
   const { subtotal, vatAmount, discountAmount, total } = computeCheckout(resolved, dType);
 
   const id = uuidv4();
@@ -149,11 +159,21 @@ router.get('/summary', (req, res) => {
 
 // Void — requires a reason, keeps the original sale row (never deleted, never
 // altered beyond the void marker itself), and writes an audit entry.
-router.delete('/:id', adminRequired, (req, res) => {
+router.delete('/:id', (req, res) => {
   const sale = db.prepare('SELECT * FROM sales WHERE id = ?').get(req.params.id);
   if (!sale) return res.status(404).json({ error: 'Sale not found' });
   const reason = (req.body && req.body.reason || '').trim();
   if (!reason) return res.status(400).json({ error: 'A reason is required to void a sale' });
+
+  if (!canApprove(db, req.user.id)) {
+    const id = uuidv4();
+    db.prepare(`
+      INSERT INTO approval_requests (id, type, sale_id, requested_by, requested_by_name, reason)
+      VALUES (?,'void',?,?,?,?)
+    `).run(id, req.params.id, req.user.id, req.user.name, reason);
+    logAudit({ userId: req.user.id, userName: req.user.name, action: 'request_approval', targetType: 'approval_request', targetId: id, details: { type: 'void', invoiceNo: sale.invoice_no } });
+    return res.json({ ok: true, pending: true, requestId: id });
+  }
 
   db.prepare(`UPDATE sales SET voided = 1, voided_by = ?, voided_at = datetime('now'), void_reason = ? WHERE id = ?`)
     .run(req.user.name, reason, req.params.id);
@@ -169,7 +189,7 @@ router.delete('/:id', adminRequired, (req, res) => {
 
 // Refund — a separate credit-memo record referencing the original sale.
 // The original sale is never edited; this is the immutable "money went back out" record.
-router.post('/:id/refund', adminRequired, (req, res) => {
+router.post('/:id/refund', (req, res) => {
   const sale = db.prepare('SELECT * FROM sales WHERE id = ?').get(req.params.id);
   if (!sale) return res.status(404).json({ error: 'Sale not found' });
   const reason = (req.body && req.body.reason || '').trim();
@@ -184,6 +204,16 @@ router.post('/:id/refund', adminRequired, (req, res) => {
   const alreadyRefunded = db.prepare('SELECT COALESCE(SUM(amount),0) t FROM refunds WHERE sale_id = ?').get(req.params.id).t;
   if (alreadyRefunded + amount > sale.total) {
     return res.status(400).json({ error: `Only ${(sale.total - alreadyRefunded).toFixed(2)} remains refundable on this sale` });
+  }
+
+  if (!canApprove(db, req.user.id)) {
+    const reqId = uuidv4();
+    db.prepare(`
+      INSERT INTO approval_requests (id, type, sale_id, requested_by, requested_by_name, amount, reason)
+      VALUES (?,'refund',?,?,?,?,?)
+    `).run(reqId, req.params.id, req.user.id, req.user.name, amount, reason);
+    logAudit({ userId: req.user.id, userName: req.user.name, action: 'request_approval', targetType: 'approval_request', targetId: reqId, details: { type: 'refund', invoiceNo: sale.invoice_no, amount } });
+    return res.json({ pending: true, requestId: reqId });
   }
 
   const id = uuidv4();

@@ -26,6 +26,7 @@ app.use('/api/notices', require('./routes/notices'));
 app.use('/api/branding', require('./routes/branding'));
 app.use('/api/recipe-image', require('./routes/recipe-images'));
 app.use('/api/shifts', require('./routes/shifts'));
+app.use('/api/approvals', require('./routes/approvals'));
 app.use('/api/requests', require('./routes/requests'));
 app.use('/api/staff-documents', require('./routes/staff-documents'));
 

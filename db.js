@@ -173,6 +173,36 @@ function initDb() {
     );
     CREATE INDEX IF NOT EXISTS idx_refunds_sale ON refunds(sale_id);
 
+    -- Void/refund requests from staff who can't approve their own — an
+    -- approver (Team Lead, Manager with permission, or Admin) reviews and the
+    -- actual void/refund only executes once approved.
+    CREATE TABLE IF NOT EXISTS approval_requests (
+      id TEXT PRIMARY KEY,
+      type TEXT NOT NULL,
+      sale_id TEXT NOT NULL REFERENCES sales(id),
+      requested_by INTEGER REFERENCES users(id),
+      requested_by_name TEXT,
+      amount REAL,
+      reason TEXT,
+      status TEXT NOT NULL DEFAULT 'pending',
+      reviewed_by TEXT,
+      reviewed_at TEXT,
+      review_notes TEXT,
+      created_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+    CREATE INDEX IF NOT EXISTS idx_approval_status ON approval_requests(status);
+
+    -- A short-lived, single-use token proving an approver signed off on a
+    -- discount live at the register, right before checkout completes.
+    CREATE TABLE IF NOT EXISTS discount_approvals (
+      id TEXT PRIMARY KEY,
+      approved_by INTEGER REFERENCES users(id),
+      approved_by_name TEXT,
+      cashier_id INTEGER REFERENCES users(id),
+      used INTEGER NOT NULL DEFAULT 0,
+      created_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+
     -- Append-only audit trail for anything BIR (or you) would want to see: voids,
     -- refunds, tax/pricing setting changes, and data resets. Never updated, only inserted.
     CREATE TABLE IF NOT EXISTS audit_log (
